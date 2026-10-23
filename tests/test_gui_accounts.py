@@ -562,7 +562,7 @@ def test_unified_launch_and_pending_callback_use_resource_owner(app, monkeypatch
     launched = []
     monkeypatch.setattr(gui.threading, 'Thread', lambda target, args, daemon:
                         SimpleNamespace(start=lambda: target(*args)))
-    monkeypatch.setattr(app, '_launch', lambda child, resource, windowed, owner:
+    monkeypatch.setattr(app, '_launch', lambda child, resource, windowed, owner, attempt=None:
                         launched.append((child._account.id, owner.id, resource['id'], windowed)))
     app._on_tile_activated(app.grid, app._child_for('same', b), windowed=True)
     assert launched == [(b.id, b.id, 'same', True)]
@@ -845,3 +845,271 @@ def test_localization_registrations_follow_native_lifetime_without_language_refr
     gc.collect()
     # No configure/refresh call is needed to remove dead registrations.
     assert tuple(map(len, registries)) == baseline
+
+
+def descendants(widget):
+    yield widget
+    child = widget.get_first_child()
+    while child:
+        yield from descendants(child)
+        child = child.get_next_sibling()
+
+
+def test_custom_shortcuts_roundtrip_in_default_settings(app):
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    mode = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                and w.get_model().get_string(0) == 'Automatic (FreeRDP default)')
+    mode.set_selected(3)
+    drain()
+    modifiers = {w.get_label(): w for w in descendants(dialog) if isinstance(w, Gtk.CheckButton)}
+    modifiers['Right Ctrl'].set_active(True)
+    modifiers['Right Shift'].set_active(True)
+    disconnect = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                      and w.get_name() == 'SDL_Disconnect')
+    disconnect.set_selected(37)  # F12, after A-Z and F1-F11
+    next(w for w in descendants(dialog) if isinstance(w, Gtk.Button) and w.get_label() == 'Save').emit('clicked')
+    saved = gui.storage.load_settings()['_default']['hotkeys']
+    assert set(saved['modifiers']) == {'KMOD_RSHIFT', 'KMOD_RCTRL'}
+    assert saved['bindings']['SDL_Disconnect'] == 'SDL_SCANCODE_F12'
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    mode = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                and w.get_model().get_string(0) == 'Automatic (FreeRDP default)')
+    assert mode.get_selected() == 3
+    dialog.destroy()
+
+
+
+def test_custom_shortcuts_validate_and_translate_live(app):
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    mode = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                and w.get_model().get_string(0) == 'Automatic (FreeRDP default)')
+    mode.set_selected(3)
+    save = next(w for w in descendants(dialog) if isinstance(w, Gtk.Button) and w.get_label() == 'Save')
+    checks = [w for w in descendants(dialog) if isinstance(w, Gtk.CheckButton)]
+    for check in checks:
+        check.set_active(False)
+    assert not save.get_sensitive()
+    checks[1].set_active(True)
+    assert save.get_sensitive()
+    actions = {w.get_name(): w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+               and w.get_name().startswith('SDL_')}
+    actions['SDL_Disconnect'].set_selected(actions['SDL_Minimize'].get_selected())
+    assert not save.get_sensitive()
+    next(w for w in descendants(dialog) if isinstance(w, Gtk.Button)
+         and w.get_label() == 'Restore FreeRDP shortcuts').emit('clicked')
+    assert save.get_sensitive()
+    assert [check.get_label() for check in checks if check.get_active()] == ['Right Shift']
+    assert actions['SDL_Disconnect'].get_selected() == 3  # D
+    for language in ('es-AR', 'es-419', 'es-ES'):
+        app._set_language(language)
+        assert checks[1].get_label() == 'Ctrl derecho'
+        assert save.get_label() == 'Guardar'
+        assert any(isinstance(w, Gtk.Label) and w.get_text() == 'Restablecer atajos de FreeRDP'
+                   for w in descendants(dialog))
+        assert mode.get_selected() == 4
+    app._set_language('en')
+    dialog.destroy()
+
+
+def test_custom_shortcuts_inherit_and_override_per_resource(app):
+    owner = add_saved(app, 'a', 'a@example.com')
+    resource = owner.resources[0]
+    custom = {'modifiers': ['KMOD_RCTRL', 'KMOD_RSHIFT'], 'bindings': {
+        'SDL_Disconnect': 'SDL_SCANCODE_D', 'SDL_Minimize': 'SDL_SCANCODE_M',
+        'SDL_Fullscreen': 'SDL_SCANCODE_RETURN', 'SDL_Resizeable': 'SDL_SCANCODE_R',
+        'SDL_Grab': 'SDL_SCANCODE_G'}}
+    app._settings['_default'] = {'hotkeys': custom}
+    assert app._eff('hotkeys', resource, owner) == custom
+    owner.resource_settings[resource['id']] = {'hotkeys': 'off'}
+    assert app._eff('hotkeys', resource, owner) == 'off'
+    owner.resource_settings[resource['id']] = {'hotkeys': 'auto'}
+    assert app._eff('hotkeys', resource, owner) == custom
+
+
+def test_restore_shortcuts_persists_defaults_mode(app):
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    mode = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                and w.get_model().get_string(0) == 'Automatic (FreeRDP default)')
+    mode.set_selected(3)
+    next(w for w in descendants(dialog) if isinstance(w, Gtk.Button)
+         and w.get_label() == 'Restore FreeRDP shortcuts').emit('clicked')
+    next(w for w in descendants(dialog) if isinstance(w, Gtk.Button)
+         and w.get_label() == 'Save').emit('clicked')
+    assert gui.storage.load_settings()['_default']['hotkeys'] == 'defaults'
+
+
+def test_unknown_saved_shortcut_blocks_save(app):
+    from avd_feed_connect.rdp.launcher import HOTKEY_DEFAULTS
+    app._settings['_default'] = {'hotkeys': {
+        'modifiers': ['KMOD_RSHIFT'],
+        'bindings': dict(HOTKEY_DEFAULTS, SDL_Disconnect='SDL_SCANCODE_UNKNOWN')}}
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    save = next(w for w in descendants(dialog) if isinstance(w, Gtk.Button) and w.get_label() == 'Save')
+    assert not save.get_sensitive()
+    dialog.destroy()
+
+
+def test_custom_shortcut_validation_follows_mode_values_when_reordered(app, monkeypatch):
+    pairs = list(zip(gui.storage.HOTKEY_VALUES, gui.storage.HOTKEY_LABELS))
+    pairs[2], pairs[3] = pairs[3], pairs[2]
+    monkeypatch.setattr(gui.storage, 'HOTKEY_VALUES', [value for value, _ in pairs])
+    monkeypatch.setattr(gui.storage, 'HOTKEY_LABELS', [label for _, label in pairs])
+    app._open_settings(None)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Default connection settings')
+    mode = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                and w.get_model().get_string(0) == 'Automatic (FreeRDP default)')
+    mode.set_selected(gui.storage.HOTKEY_VALUES.index('custom'))
+    save = next(w for w in descendants(dialog) if isinstance(w, Gtk.Button) and w.get_label() == 'Save')
+    checks = [w for w in descendants(dialog) if isinstance(w, Gtk.CheckButton)]
+    assert all(w.is_visible() for w in checks)
+    for check in checks:
+        check.set_active(False)
+    assert not save.get_sensitive()
+    mode.set_selected(gui.storage.HOTKEY_VALUES.index('off'))
+    assert save.get_sensitive()
+    dialog.destroy()
+
+
+def test_authentication_setting_roundtrip_and_inheritance(app):
+    owner = add_saved(app, 'a', 'test@example.test')
+    res = owner.resources[0]
+    app._settings['_default'] = {'sec': 'aad'}
+    assert app._eff('sec', res, owner) == 'aad'
+    app._open_settings(res, owner)
+    drain()
+    dialog = next(w for w in Gtk.Window.list_toplevels() if w.get_title().startswith('Settings —'))
+    dropdown = next(w for w in descendants(dialog) if isinstance(w, Gtk.DropDown)
+                    and w.get_model().get_string(0) == 'Automatic (use feed or remembered mode)')
+    dropdown.set_selected(2)
+    next(w for w in descendants(dialog) if isinstance(w, Gtk.Button) and w.get_label() == 'Save').emit('clicked')
+    assert owner.resource_settings[res['id']]['sec'] == 'nla'
+
+
+def test_authentication_remembered_only_after_logon_and_account_scoped(app):
+    from types import SimpleNamespace
+    from avd_feed_connect.rdp.security import SecurityDecision
+    a,b = add_saved(app, 'a', 'a@example.test'), add_saved(app, 'b', 'b@example.test')
+    res = a.resources[0]
+    child = SimpleNamespace(_security_decision=SecurityDecision('aad','connection setting',[],'fingerprint'))
+    state = {'connected':False}
+    app._on_freerdp_line(child,res,-1,'ERRCONNECT_LOGON_FAILURE',state,a)
+    drain()
+    assert res['id'] not in a.auth_modes
+    app._on_freerdp_line(child,res,-1,'Logon Info',state,a)
+    drain()
+    assert a.auth_modes[res['id']] == {'mode':'aad','fingerprint':'fingerprint'}
+    assert res['id'] not in b.auth_modes
+
+
+@pytest.mark.parametrize('override', ['aad', 'nla'])
+def test_gui_launch_passes_only_one_selected_security_mode(app, tmp_path, monkeypatch, override):
+    from pathlib import Path
+    owner = add_saved(app, 'auth-test', 'test@example.test')
+    app._select_account(owner.id)
+    res = owner.resources[0]; child = app._child_for(res['id'], owner)
+    Path(owner.client.output_dir).mkdir(parents=True, exist_ok=True)
+    path = tmp_path / 'desktop.rdp'; path.write_text('enablerdsaadauth:i:0\n')
+    fake = tmp_path / 'client'
+    fake.write_text('#!/usr/bin/python3\nimport sys\nprint(" ".join(sys.argv[1:]), flush=True)\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(gui.config, 'SDL', str(fake))
+    monkeypatch.setattr(app, '_ensure_token', lambda session: True)
+    monkeypatch.setattr(owner.client, 'download_rdp', lambda *args: str(path))
+    monkeypatch.setenv('AVD_SEC', override)
+    owner.resource_settings[res['id']] = {'extra_args': '/sec:nla /gfx'}
+    app._launch(child,res,False,owner)
+    logs=list(Path(owner.client.output_dir).glob('session_*.log'))
+    assert len(logs)==1
+    text=logs[0].read_text()
+    assert f'[AVD auth] mode={override}; reason=AVD_SEC override' in text
+    assert text.count('/sec:')==1
+    assert f'/sec:{override}' in text
+
+
+def test_cancel_pending_connection_allows_retry_without_touching_connected_session(app):
+    from avd_feed_connect.rdp.attempt import ConnectionAttempt
+    owner = add_saved(app, 'cancel', 'test@example.test')
+    app._select_account(owner.id)
+    res = owner.resources[0]; child = app._child_for(res['id'], owner)
+    attempt = ConnectionAttempt();child._attempt=attempt;child._launching=True
+    attempt.is_current = lambda: child._attempt is attempt
+    app._set_connecting(res['id'],res['title'],True,owner)
+    other = add_saved(app, 'connected', 'other@example.test')
+    app._set_tile_state(other.resources[0]['id'],'state-connected',other)
+    drain()
+    app._cancel_connection(child,res,owner,attempt)
+    drain()
+    assert attempt.cancelled.is_set()
+    assert not child._launching
+    assert not app._connect_overlay.get_visible()
+    assert app._sessions[(other.id,other.resources[0]['id'])]=='connected'
+    assert child._proc is None
+
+
+def test_cancelled_attempt_cannot_restore_overlay_or_connected_state(app):
+    from avd_feed_connect.rdp.attempt import ConnectionAttempt
+    owner=add_saved(app,'cancel','test@example.test');app._select_account(owner.id)
+    res=owner.resources[0];child=app._child_for(res['id'],owner)
+    old=ConnectionAttempt();child._attempt=old;old.is_current=lambda: child._attempt is old
+    app._set_connecting(res['id'],res['title'],True,owner,attempt=old)
+    old.cancel()
+    new=ConnectionAttempt();child._attempt=new;new.is_current=lambda: child._attempt is new
+    app._set_tile_state(res['id'],'state-connecting',owner,attempt=new)
+    app._set_tile_state(res['id'],'state-connected',owner,attempt=old)
+    drain()
+    assert app._sessions[(owner.id,res['id'])]=='connecting'
+    assert (owner.id,res['id']) not in app._connecting
+
+
+def test_cancelled_launch_never_downloads_or_starts_client(app, monkeypatch):
+    from avd_feed_connect.rdp.attempt import ConnectionAttempt
+    owner=add_saved(app,'cancel','test@example.test');app._select_account(owner.id)
+    res=owner.resources[0];child=app._child_for(res['id'],owner)
+    attempt=ConnectionAttempt();attempt.cancel()
+    monkeypatch.setattr(app,'_ensure_token',lambda *_: pytest.fail('cancelled launch must not authenticate'))
+    app._launch(child,res,False,owner,attempt)
+
+
+def test_closing_connection_login_cancels_immediately(app, monkeypatch):
+    from avd_feed_connect.rdp.attempt import ConnectionAttempt
+    owner=add_saved(app,'close-auth','test@example.test');app._select_account(owner.id)
+    res=owner.resources[0];child=app._child_for(res['id'],owner)
+    attempt=ConnectionAttempt();child._attempt=attempt;child._launching=True
+    attempt.is_current=lambda: child._attempt is attempt
+    # Exercise real GTK close-request without any navigation or remote service.
+    monkeypatch.setattr(gui.WebKit.WebView, 'load_uri', lambda *_: None)
+    app._set_connecting(res['id'],res['title'],True,owner,attempt=attempt)
+    app._resolve_aad(-1,'https://login.microsoftonline.com/common',res,owner,attempt)
+    window=next(w for w in Gtk.Window.list_toplevels() if w.get_title() == 'Sign in — '+res['title'])
+    window.emit('close-request')
+    drain()
+    assert attempt.cancelled.is_set()
+    assert attempt.close_auth is None
+    assert not child._launching
+    assert not app._connect_overlay.get_visible()
+
+
+def test_overlay_close_button_cancels_pending_attempt(app):
+    from avd_feed_connect.rdp.attempt import ConnectionAttempt
+    owner=add_saved(app,'button','test@example.test');app._select_account(owner.id)
+    res=owner.resources[0];child=app._child_for(res['id'],owner)
+    attempt=ConnectionAttempt();child._attempt=attempt;child._launching=True
+    attempt.is_current=lambda: child._attempt is attempt
+    app._set_connecting(res['id'],res['title'],True,owner,attempt=attempt)
+    drain()
+    assert app._connect_overlay.get_can_target()
+    button=next(w for w in descendants(app._connect_overlay) if isinstance(w,Gtk.Button))
+    button.emit('clicked');drain()
+    assert attempt.cancelled.is_set()
+    assert not app._connect_overlay.get_visible()

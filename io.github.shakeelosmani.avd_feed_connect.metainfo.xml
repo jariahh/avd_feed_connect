@@ -60,6 +60,25 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.0" date="2026-10-22">
+      <description>
+        <ul>
+          <li>You can now choose how each connection authenticates — Automatic,
+          Microsoft Entra ID, or NLA — and the app remembers what worked for
+          each desktop.</li>
+          <li>Client shortcuts are now configurable: keep the Right Shift
+          defaults, disable them, or set a Custom modifier and keys, with a
+          one-click restore to the FreeRDP defaults.</li>
+          <li>The connecting overlay now has a cancel button, and closing the
+          sign-in window cancels that connection cleanly so you can retry
+          without restarting; other accounts' sessions stay connected.</li>
+          <li>Fixed a clipboard hang when pasting formatted content from the
+          remote desktop into local applications on GNOME Wayland (temporary
+          SDL patch pending the upstream fix).</li>
+          <li>Thanks to Hernán López for all of the above.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.2" date="2026-10-21">
       <description>
         <ul>
