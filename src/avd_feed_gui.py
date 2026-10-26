@@ -414,7 +414,13 @@ class AvdApp(Gtk.Application):
         # ---- header bar: brand (left) · refresh + account (right) -----------
         hb = Gtk.HeaderBar()
         hb.add_css_class("avd-header")
-        hb.set_title_widget(create(Gtk.Label, ))     # blank the centered window title
+        # centered search box in the title bar — filters the workspace grid
+        self._search_q = ""
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text(tr("Search workspaces…"))
+        self.search.set_size_request(300, -1)
+        self.search.connect("search-changed", self._on_search)
+        hb.set_title_widget(self.search)
         self.win.set_titlebar(hb)
 
         brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
@@ -594,18 +600,6 @@ class AvdApp(Gtk.Application):
         self._count_lbl = create(Gtk.Label, label="", xalign=1); self._count_lbl.add_css_class("count")
         head.append(sh); head.append(self._count_lbl)
         wp.append(head)
-
-        # search/filter row — matches workspace name, resource title, or type
-        srow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        for m, v in (("start", 22), ("end", 22), ("bottom", 8)):
-            getattr(srow, f"set_margin_{m}")(v)
-        self._search_q = ""
-        self.search = Gtk.SearchEntry()
-        self.search.set_hexpand(True)
-        self.search.set_placeholder_text(tr("Search by workspace or name…"))
-        self.search.connect("search-changed", self._on_search)
-        srow.append(self.search)
-        wp.append(srow)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -1120,6 +1114,7 @@ class AvdApp(Gtk.Application):
                                    homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
                                    margin_top=8, margin_bottom=18, margin_start=22, margin_end=22)
                 grid.connect("child-activated", self._on_tile_activated)
+                grid.set_filter_func(self._tile_filter)
                 section.append(grid)
                 self.grid = grid
                 for res in resources:
@@ -1254,8 +1249,14 @@ class AvdApp(Gtk.Application):
 
     def _on_search(self, entry):
         self._search_q = (entry.get_text() or "").strip().lower()
-        if getattr(self, "grid", None) is not None:
-            self.grid.invalidate_filter()
+        # tiles live in one FlowBox per workspace/account section — invalidate each
+        seen = set()
+        for child in getattr(self, "_tiles", []):
+            parent = child.get_parent()
+            if parent is not None and id(parent) not in seen:
+                seen.add(id(parent))
+                parent.set_filter_func(self._tile_filter)
+                parent.invalidate_filter()
 
     def _tile_filter(self, child):
         q = getattr(self, "_search_q", "")
