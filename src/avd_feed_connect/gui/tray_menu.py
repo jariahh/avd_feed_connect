@@ -39,16 +39,24 @@ def _resource_item(res, session):
     return item(MARKERS.get(state, "") + res["title"], children=children)
 
 
-def build_menu(resources, sessions, *, include_footer=True):
+def build_menu(resources, sessions, *, include_footer=True, favorites=None):
     """Menu for ``resources`` (feed dicts, in grid order). ``sessions`` maps a
     resource id to {"state": "idle"|"connecting"|"connected", "running": bool}.
+    ``favorites`` (resource ids) float to a "★ FAVORITES" group at the top.
     Set ``include_footer=False`` when embedding workspace groups in a submenu."""
-    groups = {}
-    for res in resources:
-        groups.setdefault(workspace_name(res), []).append(res)
+    favorites = set(favorites or [])
     items = []
     if not resources:
         items.append(item(_("No workspaces yet"), enabled=False))
+    favs = [r for r in resources if r["id"] in favorites]
+    if favs:
+        items.append(item("★ " + _("FAVORITES"), enabled=False))
+        items += [_resource_item(r, sessions.get(r["id"], {})) for r in favs]
+    groups = {}
+    for res in resources:
+        if res["id"] in favorites:
+            continue
+        groups.setdefault(workspace_name(res), []).append(res)
     for name, members in groups.items():
         items.append(item(name.upper(), enabled=False))
         items += [_resource_item(r, sessions.get(r["id"], {})) for r in members]
@@ -60,7 +68,7 @@ def build_menu(resources, sessions, *, include_footer=True):
     return items
 
 
-def build_accounts_menu(accounts, sessions):
+def build_accounts_menu(accounts, sessions, *, favorites=None):
     """Group workspaces by account, preserving ownership in resource actions."""
     items = []
     for account in accounts:
@@ -71,7 +79,7 @@ def build_accounts_menu(accounts, sessions):
         if not resources and account.get('removed'):
             continue
         states = {r['id']: sessions.get((aid, r['id']), {}) for r in resources}
-        children = build_menu(resources, states, include_footer=False)
+        children = build_menu(resources, states, include_footer=False, favorites=favorites)
         for group in children:
             for action in group.get('children', []):
                 if action.get('action'):

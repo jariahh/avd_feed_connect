@@ -1844,7 +1844,8 @@ class AvdApp(Gtk.Application):
                     resources.append(child._res)
             accounts.append({'id': session.id, 'upn': session.display_name,
                              'resources': resources, 'removed': session.removed})
-        self._tray.set_menu(tray_menu.build_accounts_menu(accounts, states))
+        self._tray.set_menu(tray_menu.build_accounts_menu(
+            accounts, states, favorites=self._settings.get("_favorites", [])))
         n = sum(1 for state in states.values() if state['running'])
         self._tray.set_tooltip(ngettext("{count} session connected", "{count} sessions connected", n).format(count=n) if n else "")
         return False
