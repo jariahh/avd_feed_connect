@@ -23,6 +23,14 @@ def workspace_name(res):
     return res.get("tenant") or res.get("publisher") or _("Workspaces")
 
 
+def display_name(res):
+    """What to show on the menu line. Desktops are all titled 'SessionDesktop',
+    so use the workspace name; a RemoteApp's own title is meaningful, keep it."""
+    if res.get("type") == "RemoteApp" and res.get("title"):
+        return res["title"]
+    return workspace_name(res)
+
+
 def _resource_item(res, session):
     state = session.get("state") or "idle"
     running = session.get("running", False)
@@ -36,7 +44,7 @@ def _resource_item(res, session):
     else:
         children = [item(_("Connect"), ("connect", rid)),
                     item(_("Connect (windowed)"), ("connect-windowed", rid))]
-    return item(MARKERS.get(state, "") + res["title"], children=children)
+    return item(MARKERS.get(state, "") + display_name(res), children=children)
 
 
 def build_menu(resources, sessions, *, include_footer=True, favorites=None):
@@ -49,17 +57,13 @@ def build_menu(resources, sessions, *, include_footer=True, favorites=None):
     if not resources:
         items.append(item(_("No workspaces yet"), enabled=False))
     favs = [r for r in resources if r["id"] in favorites]
+    rest = [r for r in resources if r["id"] not in favorites]
     if favs:
-        items.append(item("★ " + _("FAVORITES"), enabled=False))
+        items.append(item("★ " + _("Favorites"), enabled=False))
         items += [_resource_item(r, sessions.get(r["id"], {})) for r in favs]
-    groups = {}
-    for res in resources:
-        if res["id"] in favorites:
-            continue
-        groups.setdefault(workspace_name(res), []).append(res)
-    for name, members in groups.items():
-        items.append(item(name.upper(), enabled=False))
-        items += [_resource_item(r, sessions.get(r["id"], {})) for r in members]
+        if rest:
+            items.append(item(_("Other desktops"), enabled=False))
+    items += [_resource_item(r, sessions.get(r["id"], {})) for r in rest]
     if include_footer:
         items += [SEPARATOR,
                   item(_("Refresh"), ("refresh",)),
