@@ -1514,6 +1514,13 @@ class AvdApp(Gtk.Application):
         else:
             setting = self._eff("multimon", res, session)      # "on"/"off"/None
             want_multimon = (setting == "on") if setting else (self._n_monitors > 1)
+        # Explicit monitor selection (Settings → "Use specific monitors") wins:
+        # span exactly those FreeRDP monitor ids. Not used for a windowed launch.
+        mon_ids = (self._eff("monitors", res, session) or "").strip()
+        if mon_ids and not windowed:
+            want_multimon = True
+            if "/monitors:" not in extra:
+                extra = (extra + f" /monitors:{mon_ids}").strip()
         try:
             argv += build_display_args(path, extra, want_multimon)
         except (OSError, ValueError) as error:
@@ -1925,6 +1932,33 @@ class AvdApp(Gtk.Application):
                  os.environ.get("AVD_EXTRA_ARGS", "")]
         return " ".join(p.strip() for p in parts if p and p.strip()).strip()
 
+    def _freerdp_monitors(self):
+        """Parse `sdl-freerdp /list:monitor` once → [{id,name,w,h}] for the
+        monitor picker. Uses FreeRDP's OWN ids so /monitors:<id> matches exactly."""
+        cached = getattr(self, "_fr_monitors", None)
+        if cached is not None:
+            return cached
+        import re
+        import subprocess
+        from avd_feed_connect import config
+        mons = []
+        try:
+            env = dict(os.environ)
+            if config.SDL_LIBS and os.path.isdir(config.SDL_LIBS):
+                env["LD_LIBRARY_PATH"] = config.SDL_LIBS + (
+                    os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+            out = subprocess.run([config.SDL, "/list:monitor"], capture_output=True,
+                                 text=True, timeout=20, env=env).stdout
+            for line in out.splitlines():
+                m = re.search(r"\[(\d+)\]\s+\[([^\]]*)\]\s+(\d+)x(\d+)", line)
+                if m:
+                    mons.append({"id": int(m.group(1)), "name": m.group(2),
+                                 "w": int(m.group(3)), "h": int(m.group(4))})
+        except Exception:
+            mons = []
+        self._fr_monitors = mons
+        return mons
+
     def _form_row(self, label, widget):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         lbl = create(Gtk.Label, label=label, xalign=0)
@@ -1982,6 +2016,29 @@ class AvdApp(Gtk.Application):
         mv = cur.get("multimon", "auto")
         mm_dd.set_selected(storage.MULTIMON_VALUES.index(mv) if mv in storage.MULTIMON_VALUES else 0)
         box.append(self._form_row(tr("Monitors"), mm_dd))
+
+        # Specific-monitor picker: check which monitors the remote desktop spans.
+        # Overrides the Monitors choice above by passing /multimon /monitors:<ids>.
+        monitor_checks = {}
+        _mons = self._freerdp_monitors()
+        if len(_mons) > 1:
+            _selected = [s.strip() for s in (cur.get("monitors", "") or "").split(",") if s.strip()]
+            mhdr = create(Gtk.Label, label=tr("Use specific monitors"), xalign=0)
+            box.append(mhdr)
+            mon_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            mon_col.set_halign(Gtk.Align.START)
+            mon_col.set_margin_start(6)
+            for _m in _mons:
+                cb = Gtk.CheckButton(label=f"{_m['id']} · {_m['name']} ({_m['w']}×{_m['h']})")
+                cb.set_active(str(_m["id"]) in _selected)
+                monitor_checks[str(_m["id"])] = cb
+                mon_col.append(cb)
+            box.append(mon_col)
+            mon_note = create(Gtk.Label, xalign=0, wrap=True, label=tr(
+                "Check the monitors the remote session should use. Overrides the "
+                "Monitors choice above; leave all unchecked to use it."))
+            mon_note.add_css_class("tile-sub")
+            box.append(mon_note)
 
         cert_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.CERT_LABELS]))
         cv = cur.get("cert", "auto")
@@ -2139,6 +2196,8 @@ class AvdApp(Gtk.Application):
             entry = {
                 "scale": storage.SCALE_VALUES[scale_dd.get_selected()],
                 "multimon": storage.MULTIMON_VALUES[mm_dd.get_selected()],
+                "monitors": ",".join(sorted((mid for mid, cb in monitor_checks.items()
+                                             if cb.get_active()), key=int)),
                 "cert": storage.CERT_VALUES[cert_dd.get_selected()],
                 "sec": storage.SEC_VALUES[sec_dd.get_selected()],
                 "hotkeys": hotkeys,
@@ -2156,6 +2215,7 @@ class AvdApp(Gtk.Application):
                     and entry["cert"] == "auto" and entry["sec"] == "auto" and entry["hotkeys"] == "auto" \
                     and entry["new_workspace"] == ("auto" if res else "off") \
                     and entry.get("user_agent", "auto") == "auto" \
+                    and not entry.get("monitors") \
                     and not entry["extra_args"]:
                 settings.pop(key, None)
             else:
