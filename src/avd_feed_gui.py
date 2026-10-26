@@ -1106,7 +1106,14 @@ class AvdApp(Gtk.Application):
             for resource in owner.resources:
                 groups.setdefault((resource.get("tenant_id", ""), resource.get("tenant") or "Workspace"), []).append(resource)
             if self.view_mode != "all":
-                groups = {("", ""): owner.resources}
+                favs = [r for r in owner.resources if self._is_fav(r["id"])]
+                if favs:
+                    rest = [r for r in owner.resources if not self._is_fav(r["id"])]
+                    groups = {("_fav", tr("★ Favorites")): favs}
+                    if rest:
+                        groups[("_rest", tr("Other desktops"))] = rest
+                else:
+                    groups = {("", ""): owner.resources}
             for (_, workspace), resources in groups.items():
                 if workspace:
                     label = Gtk.Label(label=workspace, xalign=0, margin_start=22, wrap=True)
@@ -1202,7 +1209,15 @@ class AvdApp(Gtk.Application):
         pill.set_valign(Gtk.Align.START)
         pill.set_visible(False)
         spacer = Gtk.Box(); spacer.set_hexpand(True)
-        top.append(ic); top.append(spacer); top.append(pill)
+        fav_btn = Gtk.ToggleButton()
+        fav_btn.add_css_class("flat"); fav_btn.add_css_class("fav-star")
+        fav_btn.set_valign(Gtk.Align.START)
+        _fav = self._is_fav(res["id"])
+        fav_btn.set_active(_fav)
+        fav_btn.set_icon_name("starred-symbolic" if _fav else "non-starred-symbolic")
+        fav_btn.set_tooltip_text(tr("Favorite"))
+        fav_btn.connect("toggled", lambda b, rid=res["id"]: self._toggle_fav(rid, b))
+        top.append(ic); top.append(spacer); top.append(fav_btn); top.append(pill)
 
         # meta: workspace name (primary) + resource title (subtitle) + type chip
         meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
@@ -1270,6 +1285,19 @@ class AvdApp(Gtk.Application):
             return True
         hay = " ".join(str(res.get(k, "")) for k in ("tenant", "title", "type")).lower()
         return q in hay
+
+    def _is_fav(self, res_id):
+        return res_id in self._settings.get("_favorites", [])
+
+    def _toggle_fav(self, res_id, btn):
+        favs = self._settings.setdefault("_favorites", [])
+        if btn.get_active() and res_id not in favs:
+            favs.append(res_id)
+        elif not btn.get_active() and res_id in favs:
+            favs.remove(res_id)
+        btn.set_icon_name("starred-symbolic" if btn.get_active() else "non-starred-symbolic")
+        storage.save_settings(self._settings)
+        self._render_resources()   # regroup Favorites / Other desktops
 
     def _set_tile_state(self, res_id, css, session=None, attempt=None, allow_cancelled=False):
         session = session or self.current

@@ -106,6 +106,8 @@ flowboxchild:focus-visible .tile { outline:2px solid @avd_accent; outline-offset
 .mon-cell:checked { background:@avd_accent; color:#ffffff; }
 .kbd { font-family:monospace; font-weight:700; font-size:12px; color:@avd_ink;
        background:@avd_surface; border:1px solid @avd_border; border-radius:6px; padding:2px 8px; }
+.fav-star { min-width:0; min-height:0; padding:3px; color:@avd_faint; }
+.fav-star:checked { color:#f5c518; }
 .chiplabel { font-size:10px; font-weight:700; letter-spacing:0.7px; color:@avd_muted; }
 .chipdot { min-width:6px; min-height:6px; border-radius:6px; background:@avd_accent; }
 .chip-app .chipdot { background:@avd_warn; }
