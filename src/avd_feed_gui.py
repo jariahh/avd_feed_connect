@@ -48,6 +48,10 @@ import shlex
 import pty
 import select
 import uuid
+# stdlib HTTP server for the loopback redirect of browser sign-in. Imported by
+# name, NOT as `import http.server`: `http` in this module is our own
+# avd_feed_connect.http (see below), and `import http.server` would shadow it.
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Software-composite WebKit (our sign-in webview) instead of the DMABUF/GBM
 # GPU path. That path fails to allocate a GBM buffer on some GPUs/drivers
@@ -92,9 +96,34 @@ from avd_feed_connect.auth.tokens import TokenStore  # noqa: E402
 from avd_feed_connect.gui.session import AccountSession  # noqa: E402
 
 APP_NAME = "AVD Feed + Connect Linux"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0-dev (browser sign-in test)"
 
 
+class _LoopbackHandler(BaseHTTPRequestHandler):
+    """Catches the one OAuth redirect from the system browser. The browser hits
+    http://127.0.0.1:<port>/?code=… after sign-in; we hand the query back to the
+    app and show a 'you can close this tab' page. Only localhost reaches it (the
+    socket is bound to 127.0.0.1), and it fires its callback exactly once."""
+
+    def do_GET(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if "code" not in qs and "error" not in qs:
+            self.send_response(204)       # ignore favicon / stray probes
+            self.end_headers()
+            return
+        body = self.server._done_html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+        self.server._on_code(qs)
+
+    def log_message(self, *a):
+        pass
 
 
 
@@ -576,9 +605,15 @@ class AvdApp(Gtk.Application):
         btn = create(Gtk.Button, label=tr("Sign in with Microsoft")); btn.add_css_class("msbtn")
         btn.set_halign(Gtk.Align.CENTER); btn.set_margin_top(20)
         btn.connect("clicked", lambda *_: self._interactive_signin())
+        browser_btn = create(Gtk.Button, label=tr("Sign in with a browser instead"))
+        browser_btn.add_css_class("flat"); browser_btn.set_halign(Gtk.Align.CENTER)
+        browser_btn.set_margin_top(6)
+        browser_btn.connect("clicked", lambda *_: self._start_browser_signin())
+        browser_sub = create(Gtk.Label, label=tr("For smart card or certificate sign-in"))
+        browser_sub.add_css_class("hero-note"); browser_sub.set_margin_top(2)
         note = create(Gtk.Label, label=tr("Unofficial client · not affiliated with or endorsed by Microsoft"))
         note.add_css_class("hero-note"); note.set_margin_top(24)
-        for w in (bm, h1, h2, btn, note):
+        for w in (bm, h1, h2, btn, browser_btn, browser_sub, note):
             signin.append(w)
         self.stack.add_named(signin, "signin")
 
@@ -819,7 +854,31 @@ class AvdApp(Gtk.Application):
                 pass
         return session.web_session
 
+    def _use_browser_signin(self):
+        """True when sign-in should go through the system browser (auth-code +
+        PKCE) instead of the embedded WebView. Needed for tenants that enforce
+        certificate-based auth (smart card / CAC / PIV): WebKitGTK has no PKCS#11
+        bridge, so it can't present a client certificate and sign-in fails before
+        the card is ever read (issue #17) — the real browser can. The browser
+        also gives passkeys/FIDO and existing SSO. AVD_BROWSER_SIGNIN forces it
+        on/off; otherwise it's the saved toggle."""
+        env = os.environ.get("AVD_BROWSER_SIGNIN", "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            return True
+        if env in ("0", "false", "no", "off"):
+            return False
+        return bool(self._settings.get("_browser_signin", False))
+
     def _interactive_signin(self, session=None):
+        # Device-code is kept as a hidden fallback (AVD_DEVICE_CODE=1) for the
+        # rare tenant that allows it; many block it via Conditional Access, so
+        # the browser auth-code flow is the default "sign in with a browser".
+        if os.environ.get("AVD_DEVICE_CODE", "").strip().lower() in ("1", "true", "yes", "on"):
+            self._devicecode_signin(session)
+            return
+        if self._use_browser_signin():
+            self._browser_signin(session)
+            return
         session = session or self.current
         if session is None:
             self._add_account()
@@ -964,6 +1023,399 @@ class AvdApp(Gtk.Application):
             self._select_account(session.id)
         except (ValueError, OSError) as error:
             self._signin_failed(session, str(error))
+        return False
+
+    def _start_browser_signin(self):
+        """Hero shortcut: switch to system-browser sign-in and start it. Sticky,
+        because a tenant that needs it (certificate-based auth) needs it for
+        every re-auth, and the toggle is reversible in Default settings."""
+        self._settings["_browser_signin"] = True
+        storage.save_settings(self._settings)
+        self._interactive_signin()
+
+    def _browser_signin(self, session=None):
+        """System-browser auth-code + PKCE sign-in (issue #17). Opens the real
+        browser so a smart card / certificate can be used, and captures the code
+        on a loopback redirect. If the loopback can't bind or isn't a registered
+        redirect for the client, the user falls back to pasting the final URL —
+        the OOB nativeclient flow, exactly like FreeRDP's 'Browse to:'."""
+        session = session or self.current
+        if session is None:
+            self._add_account()
+            return
+        if session.removed:
+            return
+        if self._signin_dlg is not None:
+            old, self._signin_dlg = self._signin_dlg, None
+            old.destroy()
+
+        verifier = _b64url(secrets.token_bytes(64))
+        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        state = secrets.token_urlsafe(16)
+
+        def authorize_url(redirect_uri):
+            params = {
+                "client_id": config.CLIENT_ID, "response_type": "code",
+                "redirect_uri": redirect_uri, "scope": config.SCOPE,
+                "code_challenge": challenge, "code_challenge_method": "S256",
+                "state": state, "prompt": "select_account",
+            }
+            if session.client.upn:
+                params["login_hint"] = session.client.upn
+            return config.LOGIN + "/authorize?" + urllib.parse.urlencode(params)
+
+        parent = self.win if self.win and self.win.get_visible() else None
+        dlg = create(Gtk.Window, title=tr("Sign in"),
+                     transient_for=parent, modal=parent is not None)
+        dlg.set_default_size(480, -1)
+        self._signin_dlg = dlg
+        done = [False]
+        server_ref = [None]
+        redirect_used = [None]   # which redirect_uri the current authorize used
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(22)
+
+        heading = create(Gtk.Label, label=tr("Sign in with your browser"), xalign=0)
+        heading.add_css_class("hero-title")
+        intro = create(Gtk.Label, xalign=0, wrap=True,
+                       label=tr("Your browser will open so you can sign in with your "
+                                "smart card or certificate."))
+        intro.add_css_class("hero-sub")
+
+        open_btn = create(Gtk.Button, label=tr("Open browser"))
+        open_btn.add_css_class("suggested-action"); open_btn.set_halign(Gtk.Align.START)
+
+        statusrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        spinner = Gtk.Spinner(); spinner.start()
+        status = create(Gtk.Label, label=tr("Waiting for you to finish signing in…"),
+                        xalign=0, wrap=True)
+        status.add_css_class("hero-sub")
+        statusrow.append(spinner); statusrow.append(status)
+
+        paste_link = create(Gtk.Button, label=tr("Paste the address instead"))
+        paste_link.add_css_class("flat"); paste_link.set_halign(Gtk.Align.START)
+        paste_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        paste_note = create(Gtk.Label, xalign=0, wrap=True,
+            label=tr("After you sign in, copy the final address from your browser and paste it here:"))
+        paste_note.add_css_class("hero-sub")
+        paste_entry = Gtk.Entry(); paste_entry.set_hexpand(True)
+        bind(paste_entry, 'placeholder_text', tr("Paste the sign-in address"))
+        paste_go = create(Gtk.Button, label=tr("Sign in"))
+        paste_go.add_css_class("suggested-action"); paste_go.set_halign(Gtk.Align.START)
+        paste_box.append(paste_note); paste_box.append(paste_entry); paste_box.append(paste_go)
+        paste_box.set_visible(False)
+
+        for w in (heading, intro, open_btn, statusrow, paste_link, paste_box):
+            box.append(w)
+        dlg.set_child(box)
+
+        done_html = (
+            "<!doctype html><meta charset=utf-8><title>%s</title>"
+            "<body style='font-family:system-ui,sans-serif;text-align:center;"
+            "margin-top:4em;color:#222'><h2>%s</h2></body>"
+            % (GLib.markup_escape_text(tr("Signed in")),
+               GLib.markup_escape_text(
+                   tr("Signed in. You can close this tab and return to the app.")))
+        )
+
+        def shutdown_server():
+            srv, server_ref[0] = server_ref[0], None
+            if srv is not None:
+                threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()),
+                                 daemon=True).start()
+
+        def on_code_main(qs):
+            if not done[0] and self._signin_dlg is dlg:
+                self._browser_complete(session, dlg, verifier, redirect_used[0],
+                                       qs, state, done, shutdown_server)
+            return False
+
+        def start_loopback():
+            try:
+                srv = HTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+            except Exception:
+                return None
+            srv._done_html = done_html
+            fired = {"v": False}
+            def guard(qs):
+                if fired["v"]:
+                    return
+                fired["v"] = True
+                GLib.idle_add(on_code_main, qs)
+            srv._on_code = guard
+            threading.Thread(target=srv.serve_forever,
+                             kwargs={"poll_interval": 0.3}, daemon=True).start()
+            return srv
+
+        def launch(url):
+            try:
+                Gio.AppInfo.launch_default_for_uri(url, None)
+            except Exception:
+                pass
+
+        def begin_paste(*_):
+            shutdown_server()
+            redirect_used[0] = config.REDIRECT
+            spinner.stop()
+            statusrow.set_visible(False)
+            paste_link.set_visible(False)
+            paste_box.set_visible(True)
+            launch(authorize_url(config.REDIRECT))
+
+        def begin_loopback():
+            srv = start_loopback()
+            server_ref[0] = srv
+            if srv is None:
+                begin_paste()
+                return
+            redirect_used[0] = "http://localhost:%d/" % srv.server_address[1]
+            launch(authorize_url(redirect_used[0]))
+
+        open_btn.connect("clicked", lambda *_: launch(authorize_url(
+            redirect_used[0] or config.REDIRECT)))
+        paste_link.connect("clicked", begin_paste)
+
+        def do_paste(*_):
+            frag = paste_entry.get_text().strip()
+            if "://" in frag:
+                p = urllib.parse.urlparse(frag)
+                frag = p.query or p.fragment
+            frag = frag.lstrip("?#")
+            qs = urllib.parse.parse_qs(frag)
+            if "code" not in qs and "error" not in qs and frag:
+                qs = {"code": [frag.split("&", 1)[0]], "state": [state]}
+            self._browser_complete(session, dlg, verifier, config.REDIRECT,
+                                   qs, state, done, shutdown_server)
+        paste_go.connect("clicked", do_paste)
+        paste_entry.connect("activate", do_paste)
+
+        def on_closed(*_):
+            if self._signin_dlg is dlg:
+                self._signin_dlg = None
+            shutdown_server()
+            if not done[0]:
+                session.pending_launch = None
+                self._discard_add(session)
+        dlg.connect("destroy", on_closed)
+        dlg.connect("close-request", lambda w: (w.destroy(), True)[1])
+
+        begin_loopback()
+        dlg.present()
+
+    def _browser_complete(self, session, dlg, verifier, redirect_uri, qs,
+                           state, done, shutdown_server):
+        if done[0]:
+            return
+        if qs.get("error"):
+            message = (qs.get("error_description") or qs.get("error"))[0]
+        elif qs.get("state", [state])[0] != state:
+            message = tr("Sign-in state mismatch, please retry.")
+        elif not qs.get("code", [""])[0]:
+            return      # nothing usable yet (e.g. a stray probe) — keep waiting
+        else:
+            message = None
+        done[0] = True
+        shutdown_server()
+        if self._signin_dlg is dlg:
+            self._signin_dlg = None
+        dlg.destroy()
+        if message is not None:
+            self._signin_failed(session, message)
+            return
+        self._show("busy", session)
+        threading.Thread(target=self._browser_exchange,
+                         args=(qs["code"][0], verifier, redirect_uri, session),
+                         daemon=True).start()
+
+    def _browser_exchange(self, code, verifier, redirect_uri, session):
+        try:
+            st, tok = http.post(config.LOGIN + "/token", {
+                "grant_type": "authorization_code", "client_id": config.CLIENT_ID,
+                "code": code, "redirect_uri": redirect_uri, "scope": config.SCOPE,
+                "code_verifier": verifier})
+            if st != 200:
+                raise ValueError(tok.get("error_description",
+                                         tok.get("error", tr("Sign-in failed"))))
+            claims_from_token(tok)
+        except Exception as error:
+            GLib.idle_add(self._signin_failed, session, str(error))
+            return
+        GLib.idle_add(self._finish_signin, session, tok)
+
+    def _devicecode_signin(self, session=None):
+        """Device-code sign-in: the app shows a short URL + code, the user
+        authenticates in their own system browser (which CAN use a smart card /
+        certificate), and we poll for the token. The browser-side companion to
+        the embedded-WebView flow in _interactive_signin (issue #17)."""
+        session = session or self.current
+        if session is None:
+            self._add_account()
+            return
+        if session.removed:
+            return
+        # Same single-surface contract as the WebView flow: tear any existing
+        # sign-in window down so closing and reopening is always a clean slate.
+        if self._signin_dlg is not None:
+            old, self._signin_dlg = self._signin_dlg, None
+            old.destroy()
+
+        parent = self.win if self.win and self.win.get_visible() else None
+        dlg = create(Gtk.Window, title=tr("Sign in"),
+                     transient_for=parent, modal=parent is not None)
+        dlg.set_default_size(460, -1)
+        self._signin_dlg = dlg
+        cancelled = threading.Event()
+        done = [False]
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(22)
+
+        heading = create(Gtk.Label, label=tr("Sign in with your browser"), xalign=0)
+        heading.add_css_class("hero-title")
+        intro = create(Gtk.Label, xalign=0, wrap=True,
+                       label=tr("Open the page below and enter this code to sign in. "
+                                "Use the browser where your smart card or certificate works."))
+        intro.add_css_class("hero-sub")
+
+        url_lbl = Gtk.Label(xalign=0, selectable=True, wrap=True)
+        url_lbl.add_css_class("status")
+        code_lbl = Gtk.Label(xalign=0, selectable=True)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        open_btn = create(Gtk.Button, label=tr("Open browser"))
+        open_btn.add_css_class("suggested-action")
+        open_btn.set_sensitive(False)
+        copy_btn = create(Gtk.Button, label=tr("Copy code"))
+        copy_btn.set_sensitive(False)
+        btns.append(open_btn)
+        btns.append(copy_btn)
+
+        statusrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        status = create(Gtk.Label, label=tr("Requesting a sign-in code…"),
+                        xalign=0, wrap=True)
+        status.add_css_class("hero-sub")
+        statusrow.append(spinner)
+        statusrow.append(status)
+
+        for w in (heading, intro, url_lbl, code_lbl, btns, statusrow):
+            box.append(w)
+        dlg.set_child(box)
+
+        state = {"url": "", "code": ""}
+
+        def do_open(*_):
+            if state["url"]:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(state["url"], None)
+                except Exception:
+                    pass
+        open_btn.connect("clicked", do_open)
+
+        def do_copy(*_):
+            if state["code"]:
+                try:
+                    copy_btn.get_clipboard().set(state["code"])
+                    copy_btn.set_label(tr("Copied"))
+                except Exception:
+                    pass
+        copy_btn.connect("clicked", do_copy)
+
+        def on_closed(*_):
+            if self._signin_dlg is dlg:
+                self._signin_dlg = None
+            cancelled.set()
+            if not done[0]:
+                session.pending_launch = None
+                self._discard_add(session)
+        dlg.connect("destroy", on_closed)
+        dlg.connect("close-request", lambda w: (w.destroy(), True)[1])
+
+        ui = {"url_lbl": url_lbl, "code_lbl": code_lbl, "open_btn": open_btn,
+              "copy_btn": copy_btn, "status": status, "state": state}
+        threading.Thread(target=self._devicecode_worker,
+                         args=(session, dlg, cancelled, done, ui),
+                         daemon=True).start()
+        dlg.present()
+
+    def _devicecode_worker(self, session, dlg, cancelled, done, ui):
+        st, dc = http.post(config.LOGIN + "/devicecode",
+                           {"client_id": config.CLIENT_ID, "scope": config.SCOPE})
+        if st != 200:
+            GLib.idle_add(self._devicecode_error, session, dlg, done,
+                          dc.get("error_description") or dc.get("error")
+                          or tr("Couldn't start sign-in. Please try again."))
+            return
+        GLib.idle_add(self._devicecode_present, dlg, cancelled, done, ui, dc)
+        interval = dc.get("interval", 5)
+        deadline = time.monotonic() + dc.get("expires_in", 900)
+        while not cancelled.is_set():
+            slept = 0.0
+            while slept < interval and not cancelled.is_set():
+                time.sleep(0.5)
+                slept += 0.5
+            if cancelled.is_set():
+                return
+            if time.monotonic() > deadline:
+                GLib.idle_add(self._devicecode_error, session, dlg, done,
+                              tr("The sign-in code expired. Please try again."))
+                return
+            st, tok = http.post(config.LOGIN + "/token", {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": config.CLIENT_ID, "device_code": dc["device_code"]})
+            if st == 200:
+                try:
+                    claims_from_token(tok)
+                except Exception as error:
+                    GLib.idle_add(self._devicecode_error, session, dlg, done, str(error))
+                    return
+                done[0] = True
+                GLib.idle_add(self._devicecode_success, session, dlg, tok)
+                return
+            err = tok.get("error", "")
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                interval += 5
+                continue
+            GLib.idle_add(self._devicecode_error, session, dlg, done,
+                          tok.get("error_description") or err
+                          or tr("Sign-in failed"))
+            return
+
+    def _devicecode_present(self, dlg, cancelled, done, ui, dc):
+        if cancelled.is_set() or done[0]:
+            return False
+        ui["state"]["url"] = (dc.get("verification_uri")
+                              or dc.get("verification_url") or "")
+        ui["state"]["code"] = dc.get("user_code", "")
+        ui["url_lbl"].set_text(ui["state"]["url"])
+        ui["code_lbl"].set_markup(
+            '<span size="xx-large" weight="bold">%s</span>'
+            % GLib.markup_escape_text(ui["state"]["code"]))
+        ui["open_btn"].set_sensitive(bool(ui["state"]["url"]))
+        ui["copy_btn"].set_sensitive(bool(ui["state"]["code"]))
+        ui["status"].set_text(tr("Waiting for you to finish signing in…"))
+        return False
+
+    def _devicecode_success(self, session, dlg, tok):
+        if self._signin_dlg is dlg:
+            self._signin_dlg = None
+        dlg.destroy()
+        self._show("busy", session)
+        self._finish_signin(session, tok)
+        return False
+
+    def _devicecode_error(self, session, dlg, done, message):
+        done[0] = True
+        if self._signin_dlg is dlg:
+            self._signin_dlg = None
+        dlg.destroy()
+        self._signin_failed(session, message)
         return False
 
     def _sign_out(self):
@@ -2076,6 +2528,23 @@ class AvdApp(Gtk.Application):
                 "notify::selected",
                 lambda dd, *_: ua_entry_row.set_visible(
                     dd.get_selected() == len(storage.UA_LABELS) - 1))
+
+            # Browser (device-code) sign-in. App-wide, applied immediately like
+            # Language — needed for certificate-based auth the WebView can't do
+            # (issue #17). The embedded sign-in window has no PKCS#11 bridge, so
+            # a smart card / CAC / PIV can't be presented there.
+            dc_check = create(Gtk.CheckButton, label=tr("Use the system browser to sign in"))
+            dc_check.set_active(bool(self._settings.get("_browser_signin", False)))
+            dc_check.connect("toggled", lambda c, *_: (
+                self._settings.__setitem__("_browser_signin", c.get_active()),
+                storage.save_settings(self._settings)))
+            box.append(dc_check)
+            dc_note = create(Gtk.Label, xalign=0, wrap=True,
+                label=tr("Required for certificate-based (CBA) sign-in — the built-in "
+                         "sign-in window can't present a smart card. The app shows a code "
+                         "to enter in your browser."))
+            dc_note.add_css_class("tile-sub")
+            box.append(dc_note)
 
         extra_entry = Gtk.Entry()
         bind(extra_entry, 'text', cur.get("extra_args", ""))
