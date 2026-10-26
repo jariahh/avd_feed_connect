@@ -1257,7 +1257,7 @@ class AvdApp(Gtk.Application):
                 resource=res["title"], workspace=res["tenant"]))
         rclick = Gtk.GestureClick()
         rclick.set_button(3)
-        rclick.connect("pressed", lambda g, n, x, y, r=res: self._open_settings(r, session))
+        rclick.connect("pressed", lambda g, n, x, y, c=child, r=res: self._tile_menu(c, r, session, x, y))
         child.add_controller(rclick)
         return child
 
@@ -2036,6 +2036,58 @@ class AvdApp(Gtk.Application):
         box.append(close)
         dlg.set_child(box)
         dlg.present()
+
+    def _disconnect_tile(self, child, res):
+        proc = getattr(child, "_proc", None)
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)   # own process group (start_new_session)
+            except (ProcessLookupError, PermissionError):
+                pass
+            self._set_status(tr("Disconnecting {resource}…").format(resource=res["title"]))
+
+    def _reconnect_tile(self, child, res, session):
+        """Disconnect, then reconnect once the old session exits — this is how a
+        monitor/settings change is applied (RDP can't add a screen mid-session)."""
+        self._disconnect_tile(child, res)
+
+        def _again():
+            if getattr(child, "_proc", None) and child._proc.poll() is None:
+                return True   # still shutting down — keep waiting
+            self._on_tile_activated(self.grid, child, windowed=False)
+            return False
+        GLib.timeout_add(400, _again)
+
+    def _tile_menu(self, child, res, session, x, y):
+        """Right-click menu on a tile: connect/disconnect/reconnect + settings."""
+        pop = Gtk.Popover(autohide=True)
+        pop.add_css_class("avd-menu")
+        pop.set_parent(child)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(6)
+
+        def item(label, cb):
+            b = create(Gtk.Button, label=label); b.add_css_class("flat")
+            b.connect("clicked", lambda *_: (pop.popdown(), cb()))
+            box.append(b)
+
+        running = bool(getattr(child, "_proc", None) and child._proc.poll() is None)
+        if running:
+            item(tr("Disconnect"), lambda: self._disconnect_tile(child, res))
+            item(tr("Reconnect (apply settings)"),
+                 lambda: self._reconnect_tile(child, res, session))
+        else:
+            item(tr("Connect"), lambda: self._on_tile_activated(self.grid, child, windowed=False))
+            item(tr("Connect (windowed)"), lambda: self._on_tile_activated(self.grid, child, windowed=True))
+        box.append(Gtk.Separator())
+        item(tr("Settings…"), lambda: self._open_settings(res, session))
+        pop.set_child(box)
+        pop.connect("closed", lambda p: p.unparent())   # don't accumulate on re-click
+        pop.popup()
 
     def _open_settings(self, res, session=None):
         session = session or self.current
