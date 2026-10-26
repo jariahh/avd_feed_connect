@@ -100,6 +100,10 @@ flowboxchild:focus-visible .tile { outline:2px solid @avd_accent; outline-offset
 
 .tname { font-weight:800; font-size:14px; color:@avd_ink; }
 .tsub { font-size:11px; color:@avd_faint; }
+.mon-map { padding:6px; background:@avd_surface; border:1px solid @avd_border; border-radius:10px; }
+.mon-cell { font-weight:800; font-size:13px; padding:0; min-width:0; min-height:0;
+            border-radius:6px; color:@avd_muted; }
+.mon-cell:checked { background:@avd_accent; color:#ffffff; }
 .chiplabel { font-size:10px; font-weight:700; letter-spacing:0.7px; color:@avd_muted; }
 .chipdot { min-width:6px; min-height:6px; border-radius:6px; background:@avd_accent; }
 .chip-app .chipdot { background:@avd_warn; }

@@ -1950,10 +1950,11 @@ class AvdApp(Gtk.Application):
             out = subprocess.run([config.SDL, "/list:monitor"], capture_output=True,
                                  text=True, timeout=20, env=env).stdout
             for line in out.splitlines():
-                m = re.search(r"\[(\d+)\]\s+\[([^\]]*)\]\s+(\d+)x(\d+)", line)
+                m = re.search(r"\[(\d+)\]\s+\[([^\]]*)\]\s+(\d+)x(\d+)\s+([+-]\d+)([+-]\d+)", line)
                 if m:
                     mons.append({"id": int(m.group(1)), "name": m.group(2),
-                                 "w": int(m.group(3)), "h": int(m.group(4))})
+                                 "w": int(m.group(3)), "h": int(m.group(4)),
+                                 "x": int(m.group(5)), "y": int(m.group(6))})
         except Exception:
             mons = []
         self._fr_monitors = mons
@@ -2017,26 +2018,35 @@ class AvdApp(Gtk.Application):
         mm_dd.set_selected(storage.MULTIMON_VALUES.index(mv) if mv in storage.MULTIMON_VALUES else 0)
         box.append(self._form_row(tr("Monitors"), mm_dd))
 
-        # Specific-monitor picker: check which monitors the remote desktop spans.
-        # Overrides the Monitors choice above by passing /multimon /monitors:<ids>.
+        # Specific-monitor picker: a clickable map laid out from the real monitor
+        # x/y/w/h. Selecting monitors passes /multimon /monitors:<ids> at launch.
         monitor_checks = {}
         _mons = self._freerdp_monitors()
         if len(_mons) > 1:
             _selected = [s.strip() for s in (cur.get("monitors", "") or "").split(",") if s.strip()]
-            mhdr = create(Gtk.Label, label=tr("Use specific monitors"), xalign=0)
-            box.append(mhdr)
-            mon_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-            mon_col.set_halign(Gtk.Align.START)
-            mon_col.set_margin_start(6)
+            box.append(create(Gtk.Label, label=tr("Use specific monitors"), xalign=0))
+            minx = min(m["x"] for m in _mons); miny = min(m["y"] for m in _mons)
+            maxx = max(m["x"] + m["w"] for m in _mons); maxy = max(m["y"] + m["h"] for m in _mons)
+            span_w = max(1, maxx - minx); span_h = max(1, maxy - miny)
+            scale = min(380.0 / span_w, 220.0 / span_h)   # fit the map in the dialog
+            fixed = Gtk.Fixed()
+            fixed.set_size_request(int(span_w * scale) + 2, int(span_h * scale) + 2)
             for _m in _mons:
-                cb = Gtk.CheckButton(label=f"{_m['id']} · {_m['name']} ({_m['w']}×{_m['h']})")
-                cb.set_active(str(_m["id"]) in _selected)
-                monitor_checks[str(_m["id"])] = cb
-                mon_col.append(cb)
-            box.append(mon_col)
+                btn = Gtk.ToggleButton(label=str(_m["id"]))
+                btn.add_css_class("mon-cell")
+                btn.set_size_request(max(26, int(_m["w"] * scale) - 4),
+                                     max(20, int(_m["h"] * scale) - 4))
+                btn.set_tooltip_text(f"{_m['id']} · {_m['name']} · {_m['w']}×{_m['h']}")
+                btn.set_active(str(_m["id"]) in _selected)
+                monitor_checks[str(_m["id"])] = btn
+                fixed.put(btn, int((_m["x"] - minx) * scale) + 1, int((_m["y"] - miny) * scale) + 1)
+            frame = Gtk.Frame(); frame.add_css_class("mon-map"); frame.set_child(fixed)
+            frame.set_halign(Gtk.Align.CENTER)
+            box.append(frame)
             mon_note = create(Gtk.Label, xalign=0, wrap=True, label=tr(
-                "Check the monitors the remote session should use. Overrides the "
-                "Monitors choice above; leave all unchecked to use it."))
+                "Click the monitors (laid out as on your desk) the remote session should use. "
+                "One = that single screen; several = spanned. Overrides the Monitors choice "
+                "above; none selected uses it."))
             mon_note.add_css_class("tile-sub")
             box.append(mon_note)
 
