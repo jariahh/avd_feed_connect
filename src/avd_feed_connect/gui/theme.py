@@ -99,6 +99,7 @@ flowboxchild:focus-visible .tile { outline:2px solid @avd_accent; outline-offset
 .ic.app image { color:@avd_warn; }
 
 .tname { font-weight:800; font-size:14px; color:@avd_ink; }
+.tsub { font-size:11px; color:@avd_faint; }
 .chiplabel { font-size:10px; font-weight:700; letter-spacing:0.7px; color:@avd_muted; }
 .chipdot { min-width:6px; min-height:6px; border-radius:6px; background:@avd_accent; }
 .chip-app .chipdot { background:@avd_warn; }

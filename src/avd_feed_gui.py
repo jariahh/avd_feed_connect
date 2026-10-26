@@ -595,6 +595,18 @@ class AvdApp(Gtk.Application):
         head.append(sh); head.append(self._count_lbl)
         wp.append(head)
 
+        # search/filter row — matches workspace name, resource title, or type
+        srow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        for m, v in (("start", 22), ("end", 22), ("bottom", 8)):
+            getattr(srow, f"set_margin_{m}")(v)
+        self._search_q = ""
+        self.search = Gtk.SearchEntry()
+        self.search.set_hexpand(True)
+        self.search.set_placeholder_text(tr("Search by workspace or name…"))
+        self.search.connect("search-changed", self._on_search)
+        srow.append(self.search)
+        wp.append(srow)
+
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         sw.set_vexpand(True)
@@ -605,6 +617,7 @@ class AvdApp(Gtk.Application):
         self.grid.set_margin_top(8); self.grid.set_margin_bottom(18)
         self.grid.set_margin_start(22); self.grid.set_margin_end(22)
         self.grid.connect("child-activated", self._on_tile_activated)
+        self.grid.set_filter_func(self._tile_filter)
         self._resource_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.START)
         self._resource_box.append(self.grid)
         sw.set_child(self._resource_box)
@@ -1193,11 +1206,14 @@ class AvdApp(Gtk.Application):
         spacer = Gtk.Box(); spacer.set_hexpand(True)
         top.append(ic); top.append(spacer); top.append(pill)
 
-        # meta: title + type chip
-        meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        title = create(Gtk.Label, label=res["title"], xalign=0); title.add_css_class("tname")
+        # meta: workspace name (primary) + resource title (subtitle) + type chip
+        meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        ws_name = res.get("tenant") or res["title"]
+        title = create(Gtk.Label, label=ws_name, xalign=0); title.add_css_class("tname")
         title.set_wrap(True); title.set_max_width_chars(18); title.set_lines(2)
         title.set_ellipsize(3)
+        sub = create(Gtk.Label, label=res["title"], xalign=0); sub.add_css_class("tsub")
+        sub.set_wrap(False); sub.set_max_width_chars(22); sub.set_ellipsize(3)
         chip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         if not is_desktop:
             chip.add_css_class("chip-app")
@@ -1206,7 +1222,7 @@ class AvdApp(Gtk.Application):
         clabel = create(Gtk.Label, label=tr("DESKTOP") if is_desktop else tr("REMOTE APP"))
         clabel.add_css_class("chiplabel")
         chip.append(dot); chip.append(clabel)
-        meta.append(title); meta.append(chip)
+        meta.append(title); meta.append(sub); meta.append(chip)
 
         tile.append(top); tile.append(meta)
 
@@ -1235,6 +1251,21 @@ class AvdApp(Gtk.Application):
     def _child_for(self, res_id, session=None):
         session = session or self.current
         return session.tiles.get(res_id) if session else None
+
+    def _on_search(self, entry):
+        self._search_q = (entry.get_text() or "").strip().lower()
+        if getattr(self, "grid", None) is not None:
+            self.grid.invalidate_filter()
+
+    def _tile_filter(self, child):
+        q = getattr(self, "_search_q", "")
+        if not q:
+            return True
+        res = getattr(child, "_res", None)
+        if not res:
+            return True
+        hay = " ".join(str(res.get(k, "")) for k in ("tenant", "title", "type")).lower()
+        return q in hay
 
     def _set_tile_state(self, res_id, css, session=None, attempt=None, allow_cancelled=False):
         session = session or self.current
