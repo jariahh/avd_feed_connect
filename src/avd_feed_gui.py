@@ -506,6 +506,9 @@ class AvdApp(Gtk.Application):
         setbtn = create(Gtk.Button, label=tr("Default settings…")); setbtn.add_css_class("flat")
         setbtn.connect("clicked", lambda *_: (settings_pop.popdown(), self._open_settings(None)))
         pbox.append(setbtn)
+        kbdbtn = create(Gtk.Button, label=tr("Keyboard shortcuts…")); kbdbtn.add_css_class("flat")
+        kbdbtn.connect("clicked", lambda *_: (settings_pop.popdown(), self._show_shortcuts()))
+        pbox.append(kbdbtn)
         settings_pop = pop
         settings_pop.add_css_class("avd-menu")
         self._settings_pop = settings_pop
@@ -1968,6 +1971,43 @@ class AvdApp(Gtk.Application):
         row.append(lbl)
         row.append(widget)
         return row
+
+    def _show_shortcuts(self, *_):
+        """In-session FreeRDP keyboard shortcuts — the way out of a fullscreen VDI."""
+        if getattr(self, "_settings_pop", None):
+            self._settings_pop.popdown()
+        dlg = create(Gtk.Window, title=tr("Keyboard shortcuts"), transient_for=self.win, modal=True)
+        dlg.add_css_class("avd-settings")
+        dlg.set_default_size(380, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(16)
+        box.append(create(Gtk.Label, xalign=0, wrap=True, label=tr(
+            "Inside a remote (VDI) session, hold the modifier and press a key:")))
+        pretty = {"RETURN": "Enter", "ESCAPE": "Esc", "SPACE": "Space", "TAB": "Tab",
+                  "BACKSPACE": "Backspace", "INSERT": "Insert", "DELETE": "Delete",
+                  "HOME": "Home", "END": "End", "PAGEUP": "Page Up", "PAGEDOWN": "Page Down"}
+        modifier = tr("Right Shift")
+        for action, label in HOTKEY_ACTIONS.items():
+            key = HOTKEY_DEFAULTS[action].removeprefix("SDL_SCANCODE_")
+            key = pretty.get(key, key)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            name = create(Gtk.Label, label=tr(label), xalign=0); name.set_hexpand(True)
+            combo = create(Gtk.Label, label=f"{modifier} + {key}", xalign=1)
+            combo.add_css_class("kbd")
+            row.append(name); row.append(combo)
+            box.append(row)
+        note = create(Gtk.Label, xalign=0, wrap=True, label=tr(
+            "These are the default FreeRDP shortcuts. Change the modifier or keys "
+            "per desktop in Settings → Client shortcuts."))
+        note.add_css_class("tile-sub")
+        box.append(note)
+        close = create(Gtk.Button, label=tr("Close")); close.add_css_class("suggested-action")
+        close.set_halign(Gtk.Align.END)
+        close.connect("clicked", lambda *_: dlg.destroy())
+        box.append(close)
+        dlg.set_child(box)
+        dlg.present()
 
     def _open_settings(self, res, session=None):
         session = session or self.current
